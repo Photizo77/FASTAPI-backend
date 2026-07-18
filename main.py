@@ -1,0 +1,204 @@
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel, Field
+from typing import List, Optional
+
+# Security imports
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+
+# SQLAlchemy imports
+from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
+
+app = FastAPI()
+
+# ==========================================
+# 1. SECURITY CONFIGURATION (The Bouncer's Rulebook)
+# ==========================================
+# In a real app, put this in a .env file!
+SECRET_KEY = "super-secret-key-that-you-should-never-commit-to-github"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# ==========================================
+# 2. DATABASE SETUP (The Warehouse)
+# ==========================================
+SQLALCHEMY_DATABASE_URL = "sqlite:///./brewmaster.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# --- Coffee Model ---
+class CoffeeDB(Base):
+    __tablename__ = "coffees"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    name = Column(String, index=True)
+    description = Column(String, nullable=True)
+    price = Column(Float)
+
+# --- User Model (NEW!) ---
+class UserDB(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    username = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    role = Column(String, default="customer") # 'customer' or 'manager'
+
+Base.metadata.create_all(bind=engine)
+
+# ==========================================
+# 3. PYDANTIC SCHEMAS (The Order Forms)
+# ==========================================
+class CoffeeCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    price: float = Field(gt=0)
+
+class CoffeeResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    price: float
+    class Config:
+        from_attributes = True
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "customer"
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    role: str
+    class Config:
+        from_attributes = True
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+# ==========================================
+# 4. HELPER FUNCTIONS (The Blenders & Wristband Makers)
+# ==========================================
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# ==========================================
+# 5. DEPENDENCIES (The VIP Bouncers)
+# ==========================================
+def get_current_user(
+    db: Session = Depends(get_db), 
+    token: str = Depends(oauth2_scheme)
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        # Decode the wristband (JWT)
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+        
+    # Look up the user in the database
+    user = db.query(UserDB).filter(UserDB.username == username).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+def get_manager_user(current_user: UserDB = Depends(get_current_user)):
+    if current_user.role != "manager":
+        raise HTTPException(status_code=403, detail="Access denied. Managers only!")
+    return current_user
+
+# ==========================================
+# 6. THE ROUTES (The Waiters)
+# ==========================================
+
+# --- USER REGISTRATION ---
+@app.post("/users/register", response_model=UserResponse)
+def register_user(user: UserCreate, db: Session = Depends(get_db)):
+    # Check if user exists
+    db_user = db.query(UserDB).filter(UserDB.username == user.username).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    # Hash the password and save
+    hashed_pw = get_password_hash(user.password)
+    db_user = UserDB(username=user.username, hashed_password=hashed_pw, role=user.role)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+# --- LOGIN (Get your Wristband) ---
+@app.post("/token", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    
+    # Create the JWT
+    access_token = create_access_token(data={"sub": user.username, "role": user.role})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# --- COFFEE ROUTES ---
+@app.post("/coffees/", response_model=CoffeeResponse)
+def create_coffee(coffee: CoffeeCreate, db: Session = Depends(get_db), manager: UserDB = Depends(get_manager_user)):
+    db_coffee = CoffeeDB(name=coffee.name, description=coffee.description, price=coffee.price)
+    db.add(db_coffee)
+    db.commit()
+    db.refresh(db_coffee)
+    return db_coffee
+
+@app.get("/coffees/", response_model=List[CoffeeResponse])
+def read_coffees(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    # Notice: No manager dependency here! Anyone can view the menu.
+    return db.query(CoffeeDB).offset(skip).limit(limit).all()
+
+@app.put("/coffees/{coffee_id}", response_model=CoffeeResponse)
+def update_coffee(coffee_id: int, coffee: CoffeeCreate, db: Session = Depends(get_db), manager: UserDB = Depends(get_manager_user)):
+    db_coffee = db.query(CoffeeDB).filter(CoffeeDB.id == coffee_id).first()
+    if not db_coffee:
+        raise HTTPException(status_code=404, detail="Coffee not found")
+    db_coffee.name = coffee.name
+    db_coffee.description = coffee.description
+    db_coffee.price = coffee.price
+    db.commit()
+    db.refresh(db_coffee)
+    return db_coffee
+
+@app.delete("/coffees/{coffee_id}")
+def delete_coffee(coffee_id: int, db: Session = Depends(get_db), manager: UserDB = Depends(get_manager_user)):
+    db_coffee = db.query(CoffeeDB).filter(CoffeeDB.id == coffee_id).first()
+    if not db_coffee:
+        raise HTTPException(status_code=404, detail="Coffee not found")
+    db.delete(db_coffee)
+    db.commit()
+    return {"message": "Coffee deleted"}
