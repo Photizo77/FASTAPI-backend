@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from typing import List, Optional
+import os
 
 # Security imports
 from passlib.context import CryptContext
@@ -18,9 +19,8 @@ app = FastAPI()
 # 1. SECURITY CONFIGURATION (The Bouncer's Rulebook)
 # ==========================================
 # In a real app, put this in a .env file!
-SECRET_KEY = "super-secret-key-that-you-should-never-commit-to-github"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+# Read from environment variables if available, otherwise use local default
+SECRET_KEY = os.environ.get("SECRET_KEY", "super-secret-key-that-you-should-never-commit-to-github")
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -28,61 +28,22 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 # ==========================================
 # 2. DATABASE SETUP (The Warehouse)
 # ==========================================
-SQLALCHEMY_DATABASE_URL = "sqlite:///./brewmaster.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+# ==========================================
+# 2. DATABASE SETUP (The Warehouse)
+# ==========================================
+# If Render provides a DATABASE_URL, use it. Otherwise, use local SQLite.
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./brewmaster.db")
+
+# Postgres and SQLite need slightly different engine setups
+if DATABASE_URL.startswith("postgres"):
+    # For Render/Postgres
+    engine = create_engine(DATABASE_URL)
+else:
+    # For Local/SQLite
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
-
-# --- Coffee Model ---
-class CoffeeDB(Base):
-    __tablename__ = "coffees"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    name = Column(String, index=True)
-    description = Column(String, nullable=True)
-    price = Column(Float)
-
-# --- User Model (NEW!) ---
-class UserDB(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    username = Column(String, unique=True, index=True)
-    hashed_password = Column(String)
-    role = Column(String, default="customer") # 'customer' or 'manager'
-
-Base.metadata.create_all(bind=engine)
-
-# ==========================================
-# 3. PYDANTIC SCHEMAS (The Order Forms)
-# ==========================================
-class CoffeeCreate(BaseModel):
-    name: str
-    description: Optional[str] = None
-    price: float = Field(gt=0)
-
-class CoffeeResponse(BaseModel):
-    id: int
-    name: str
-    description: Optional[str] = None
-    price: float
-    class Config:
-        from_attributes = True
-
-class UserCreate(BaseModel):
-    username: str
-    password: str
-    role: str = "customer"
-
-class UserResponse(BaseModel):
-    id: int
-    username: str
-    role: str
-    class Config:
-        from_attributes = True
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
 # ==========================================
 # 4. HELPER FUNCTIONS (The Blenders & Wristband Makers)
 # ==========================================
